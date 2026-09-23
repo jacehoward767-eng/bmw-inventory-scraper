@@ -302,40 +302,54 @@ def get_attr(car: dict, name: str, fallback: str = "N/A") -> str:
 
 
 def get_pricing_field(car: dict) -> str:
-    """Extracts vehicle price across all standard Dealer.com payload structures."""
-    # 1. Top-level pricing keys
-    for key in ["price", "salePrice", "internetPrice", "askingPrice", "retailPrice", "finalPrice"]:
-        num = clean_num(car.get(key))
-        if num and num > 0:
-            return f"${num:,}"
+    """
+    Extracts vehicle price across all standard Dealer.com payload structures,
+    covering Used prices, New car MSRPs, and composite pricing blocks.
+    """
+    # Keys to prioritize (sale/asking first, then MSRP/retail/composite)
+    target_keys = [
+        "price", "saleprice", "internetprice", "askingprice", 
+        "finalprice", "compositeprice", "msrp", "retailprice", 
+        "baseprice", "displayprice"
+    ]
 
-    # 2. priceOverview object
+    # 1. Check direct top-level keys
+    for k, v in car.items():
+        if k.lower() in target_keys:
+            num = clean_num(v)
+            if num and num > 0:
+                return f"${num:,}"
+
+    # 2. Check priceOverview block
     po = car.get("priceOverview", {})
     if isinstance(po, dict):
-        for key in ["price", "salePrice", "internetPrice", "askingPrice", "displayPrice"]:
-            num = clean_num(po.get(key))
-            if num and num > 0:
-                return f"${num:,}"
-
-    # 3. pricing dictionary or list
-    pricing = car.get("pricing", {})
-    if isinstance(pricing, dict):
-        for key in ["finalPrice", "salePrice", "internetPrice", "retailPrice", "askingPrice", "price"]:
-            num = clean_num(pricing.get(key))
-            if num and num > 0:
-                return f"${num:,}"
-    elif isinstance(pricing, list):
-        for item in pricing:
-            if isinstance(item, dict):
-                num = clean_num(item.get("value") or item.get("price"))
+        for k, v in po.items():
+            if k.lower() in target_keys:
+                num = clean_num(v)
                 if num and num > 0:
                     return f"${num:,}"
 
-    # 4. Attributes list
+    # 3. Check pricing structure (can be dict or list)
+    pricing = car.get("pricing", {})
+    if isinstance(pricing, dict):
+        for k, v in pricing.items():
+            if k.lower() in target_keys:
+                num = clean_num(v)
+                if num and num > 0:
+                    return f"${num:,}"
+    elif isinstance(pricing, list):
+        for item in pricing:
+            if isinstance(item, dict):
+                # Often formatted as {"type": "MSRP", "value": 78900}
+                num = clean_num(item.get("value") or item.get("price") or item.get("amount"))
+                if num and num > 0:
+                    return f"${num:,}"
+
+    # 4. Check attributes array (handles both "msrp", "internetPrice", etc.)
     for attr in car.get("attributes", []):
         if isinstance(attr, dict):
-            name = attr.get("name", "").lower()
-            if any(p in name for p in ["price", "internetprice", "saleprice", "retailprice", "askingprice"]):
+            name = str(attr.get("name", "")).lower()
+            if any(t in name for t in target_keys):
                 num = clean_num(attr.get("value"))
                 if num and num > 0:
                     return f"${num:,}"
