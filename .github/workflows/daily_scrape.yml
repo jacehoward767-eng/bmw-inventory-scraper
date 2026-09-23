@@ -2,21 +2,30 @@ name: Daily Inventory Scrape
 
 on:
   schedule:
-    # 12:00 UTC is 7:00 AM CDT (Central Daylight Time)
     - cron: '0 12 * * *'
-  # Allows you to click a button and run it manually anytime
   workflow_dispatch:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   scrape:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,11 +48,24 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Inventory Scraper
-        run: |
-          python maps.py
+        run: python maps.py
 
-      - name: Commit and Push Inventory Updates
+      - name: Commit and Push Reports to Private Repo
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'Automated daily inventory snapshot'
           file_pattern: 'BMW_Inventory_Reports/*.xlsx inventory.json'
+
+      - name: Stage JSON for Pages
+        run: |
+          mkdir -p _site
+          cp inventory.json _site/index.json
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '_site'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
