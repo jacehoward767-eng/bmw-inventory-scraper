@@ -42,7 +42,6 @@ PAGE_LOAD_WAIT   = 8      # seconds to wait for JS to render view count
 REQUEST_DELAY    = 1.5    # seconds between vehicle page loads (base)
 PHOTO_THRESHOLD  = 3      # vehicles with fewer photos than this need shooting
 
-# Residential proxy config — set to None to disable
 PROXY = None
 
 SUV_PREFIXES = ["X1", "X2", "X3", "X4", "X5", "X6", "X7", "XM", "IX"]
@@ -53,6 +52,17 @@ def jitter_delay(base: float = REQUEST_DELAY):
     """Sleep for base seconds ± up to 40% to avoid rhythmic bot signatures."""
     spread = base * 0.4
     time.sleep(base + random.uniform(-spread, spread))
+
+
+def clean_num(val) -> int | None:
+    """Helper to extract a pure integer from strings like '$81,980' or '13,620 miles'."""
+    if val is None:
+        return None
+    cleaned = re.sub(r'[^\d.]', '', str(val))
+    try:
+        return int(float(cleaned)) if cleaned else None
+    except (ValueError, TypeError):
+        return None
 
 
 def build_driver() -> webdriver.Chrome:
@@ -292,25 +302,62 @@ def get_attr(car: dict, name: str, fallback: str = "N/A") -> str:
 
 
 def get_pricing_field(car: dict) -> str:
-    """Extract standard retail price or internet price from DDC pricing blocks."""
+    """Extracts vehicle price across all standard Dealer.com payload structures."""
+    # 1. Top-level pricing keys
+    for key in ["price", "salePrice", "internetPrice", "askingPrice", "retailPrice", "finalPrice"]:
+        num = clean_num(car.get(key))
+        if num and num > 0:
+            return f"${num:,}"
+
+    # 2. priceOverview object
+    po = car.get("priceOverview", {})
+    if isinstance(po, dict):
+        for key in ["price", "salePrice", "internetPrice", "askingPrice", "displayPrice"]:
+            num = clean_num(po.get(key))
+            if num and num > 0:
+                return f"${num:,}"
+
+    # 3. pricing dictionary or list
     pricing = car.get("pricing", {})
     if isinstance(pricing, dict):
-        for key in ["finalPrice", "salePrice", "internetPrice", "retailPrice", "askingPrice"]:
-            val = pricing.get(key)
-            if val and str(val).replace("$", "").replace(",", "").strip().isdigit():
-                return f"${int(float(val)):,}"
-    
-    attr_price = get_attr(car, "internetPrice", fallback="") or get_attr(car, "retailPrice", fallback="")
-    if attr_price and attr_price.replace("$", "").replace(",", "").strip().isdigit():
-        return f"${int(float(attr_price)):,}"
+        for key in ["finalPrice", "salePrice", "internetPrice", "retailPrice", "askingPrice", "price"]:
+            num = clean_num(pricing.get(key))
+            if num and num > 0:
+                return f"${num:,}"
+    elif isinstance(pricing, list):
+        for item in pricing:
+            if isinstance(item, dict):
+                num = clean_num(item.get("value") or item.get("price"))
+                if num and num > 0:
+                    return f"${num:,}"
+
+    # 4. Attributes list
+    for attr in car.get("attributes", []):
+        if isinstance(attr, dict):
+            name = attr.get("name", "").lower()
+            if any(p in name for p in ["price", "internetprice", "saleprice", "retailprice", "askingprice"]):
+                num = clean_num(attr.get("value"))
+                if num and num > 0:
+                    return f"${num:,}"
+
     return "Call"
 
 
 def get_mileage_field(car: dict) -> str:
-    """Extract odometer reading."""
-    miles = get_attr(car, "odometer", fallback="") or car.get("odometer", "")
-    if miles and str(miles).replace(",", "").strip().isdigit():
-        return f"{int(float(miles)):,}"
+    """Extracts odometer reading across DDC payload variations."""
+    for key in ["odometer", "mileage", "miles"]:
+        num = clean_num(car.get(key))
+        if num and num > 0:
+            return f"{num:,}"
+
+    for attr in car.get("attributes", []):
+        if isinstance(attr, dict):
+            name = attr.get("name", "").lower()
+            if name in ["odometer", "mileage", "miles", "odometervalue"]:
+                num = clean_num(attr.get("value"))
+                if num and num > 0:
+                    return f"{num:,}"
+
     return "N/A"
 
 
