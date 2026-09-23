@@ -16,16 +16,15 @@ Run:
     python maps.py
 """
 
-import requests
-import cloudscraper
-import pandas as pd
-from datetime import datetime, timezone
 import os
 import re
 import time
 import glob
-import random
 import json
+import random
+from datetime import datetime, timezone
+import pandas as pd
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -49,28 +48,6 @@ PHOTO_THRESHOLD  = 3      # vehicles with fewer photos than this need shooting
 PROXY = None
 
 SUV_PREFIXES = ["X1", "X2", "X3", "X4", "X5", "X6", "X7", "XM", "IX"]
-
-# Realistic browser headers that mirror a Chrome 123 request
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Content-Type":    "application/json",
-    "Origin":          BASE_URL,
-    "Referer":         f"{BASE_URL}/new-inventory/",
-    "Sec-Ch-Ua":       '"Google Chrome";v="123", "Not:A-Brand";v="8"',
-    "Sec-Ch-Ua-Mobile":   "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest":     "empty",
-    "Sec-Fetch-Mode":     "cors",
-    "Sec-Fetch-Site":     "same-origin",
-    "Connection":         "keep-alive",
-}
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -80,42 +57,55 @@ def jitter_delay(base: float = REQUEST_DELAY):
     time.sleep(base + random.uniform(-spread, spread))
 
 
-def build_session() -> requests.Session:
-    """Build a requests session that mimics a browser and handles Cloudflare."""
-    try:
-        session = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        session.headers.update(BROWSER_HEADERS)
-        print("  Using cloudscraper session (Cloudflare bypass enabled).")
-    except Exception:
-        print("  cloudscraper unavailable, using plain requests session.")
-        session = requests.Session()
-        session.headers.update(BROWSER_HEADERS)
+def build_driver() -> webdriver.Chrome:
+    """Builds a headless Chrome instance configured to bypass Akamai bot detection."""
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--remote-debugging-port=9222")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    )
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
 
     if PROXY:
-        session.proxies.update({"http": PROXY, "https": PROXY})
-        print(f"  Routing through proxy: {PROXY.split('@')[-1]}")
+        opts.add_argument(f"--proxy-server={PROXY}")
 
-    return session
+    service = Service(ChromeDriverManager().install())
+    driver  = webdriver.Chrome(service=service, options=opts)
+    
+    # Mask navigator.webdriver
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.navigator.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        """},
+    )
+    return driver
 
 
-def warm_up_session(session) -> None:
-    """Visit the inventory page first so the server issues valid session cookies."""
+def fetch_inventory(driver: webdriver.Chrome) -> list:
+    """
+    Fetches inventory via the DDC API by executing fetch() calls inside
+    an active Chrome session to inherit valid Akamai bot-verification cookies.
+    """
+    print(f"Connecting to {DEALER_SITE_ID} via Chrome session...")
     warm_url = f"{BASE_URL}/new-inventory/"
-    try:
-        print(f"  Warming up session via {warm_url} ...", end=" ", flush=True)
-        resp = session.get(warm_url, timeout=15)
-        print(f"HTTP {resp.status_code} — cookies: {list(resp.cookies.keys()) or 'none'}")
-        jitter_delay(2.0)
-    except Exception as e:
-        print(f"Warm-up request failed ({e}), continuing anyway.")
-
-
-def fetch_inventory() -> tuple[list, object]:
-    print(f"Connecting to {DEALER_SITE_ID} to fetch full inventory...")
-    session = build_session()
-    warm_up_session(session)
+    print(f"  Warming up browser on {warm_url} ...")
+    driver.get(warm_url)
+    
+    # Allow Akamai scripts to execute and drop tokens
+    time.sleep(6)
 
     full_inventory = []
     seen_vins = set()
@@ -125,6 +115,33 @@ def fetch_inventory() -> tuple[list, object]:
         {"alias": "INVENTORY_LISTING_DEFAULT_AUTO_USED", "config_id": "auto-used"},
         {"alias": "SITEBUILDER_RETIRED_SERVICE_LOANERS_1", "config_id": "auto-rsl"},
     ]
+
+    fetch_script = """
+    const url = arguments[0];
+    const payload = arguments[1];
+    const callback = arguments[arguments.length - 1];
+
+    fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/plain, */*'
+        },
+        body: JSON.stringify(payload)
+    })
+    .then(async response => {
+        const text = await response.text();
+        try {
+            const data = JSON.parse(text);
+            callback({status: response.status, data: data});
+        } catch(e) {
+            callback({status: response.status, rawText: text, error: 'JSON parse error'});
+        }
+    })
+    .catch(err => {
+        callback({status: 0, error: err.toString()});
+    });
+    """
 
     for ep in endpoints:
         label = ep["config_id"]
@@ -155,15 +172,19 @@ def fetch_inventory() -> tuple[list, object]:
             items = []
             for attempt in range(1, 4):
                 try:
-                    resp = session.post(API_URL, json=payload, timeout=20)
-                    resp.raise_for_status()
-                    data  = resp.json()
-                    items = data.get("inventory", [])
-                    success = True
-                    break
-                except Exception as json_err:
-                    print(f"(Attempt {attempt} failed: {json_err})", end=" ")
-                    time.sleep(attempt * 5)
+                    res = driver.execute_async_script(fetch_script, API_URL, payload)
+                    status = res.get("status")
+                    if status == 200:
+                        items = res.get("data", {}).get("inventory", [])
+                        success = True
+                        break
+                    else:
+                        err_msg = res.get("error") or f"HTTP {status}"
+                        print(f"(Attempt {attempt} failed: {err_msg})", end=" ")
+                        time.sleep(attempt * 4)
+                except Exception as e:
+                    print(f"(Attempt {attempt} driver error: {e})", end=" ")
+                    time.sleep(attempt * 4)
 
             if not success:
                 print("Failed after 3 attempts. Stopping pagination for this category.")
@@ -194,38 +215,10 @@ def fetch_inventory() -> tuple[list, object]:
                 print("0 vehicles found (End of category).")
                 break
 
-    return full_inventory, session
+    return full_inventory
 
 
 # ─── SELENIUM / VIEW COUNT ────────────────────────────────────────────────────
-
-def build_driver() -> webdriver.Chrome:
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--remote-debugging-port=9222")
-    opts.add_argument("--window-size=1280,900")
-    opts.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-    )
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-
-    if PROXY:
-        opts.add_argument(f"--proxy-server={PROXY}")
-
-    service = Service(ChromeDriverManager().install())
-    driver  = webdriver.Chrome(service=service, options=opts)
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
-    )
-    return driver
-
 
 def get_view_count(driver: webdriver.Chrome, url: str) -> str:
     try:
@@ -313,7 +306,7 @@ def get_pricing_field(car: dict) -> str:
             val = pricing.get(key)
             if val and str(val).replace("$", "").replace(",", "").strip().isdigit():
                 return f"${int(float(val)):,}"
-    # Check attributes fallback
+    
     attr_price = get_attr(car, "internetPrice", fallback="") or get_attr(car, "retailPrice", fallback="")
     if attr_price and attr_price.replace("$", "").replace(",", "").strip().isdigit():
         return f"${int(float(attr_price)):,}"
@@ -653,7 +646,7 @@ def export_to_excel(results: list, changes: dict, prev_df: pd.DataFrame | None) 
 
 
 def export_to_json(results: list) -> str:
-    """Exports a lightweight JSON formatted specifically for iPhone Shortcuts / LLM lookup."""
+    """Exports a clean JSON file optimized for iPhone Shortcuts / Siri consumption."""
     clean_records = []
     for r in results:
         vin = str(r.get("VIN", "")).strip()
@@ -690,28 +683,32 @@ def main():
     print(f"  Run time: {start_time.strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
 
-    # 1. Fetch inventory via API
-    print("\n[1/4] Fetching inventory from dealer API...")
-    inventory, _ = fetch_inventory()
-
-    if not inventory:
-        print("\nNo inventory returned. Stopping.")
-        return
-
-    print(f"\n  Total vehicles to process: {len(inventory)}")
-
-    # 2. Scrape view counts via headless browser
-    print("\n[2/4] Launching headless browser to collect view counts...")
+    # 1. Initialize Headless Browser
+    print("\n[1/4] Launching headless browser...")
     driver = build_driver()
+
     try:
+        # 2. Fetch inventory via Chrome-driven API calls
+        print("\n[2/4] Fetching inventory from dealer API...")
+        inventory = fetch_inventory(driver)
+
+        if not inventory:
+            print("\nNo inventory returned. Stopping.")
+            return
+
+        print(f"\n  Total vehicles to process: {len(inventory)}")
+
+        # 3. Scrape view counts
+        print("\n[3/4] Collecting view counts across vehicle pages...")
         results = process_data(inventory, driver)
+
     finally:
         driver.quit()
 
     results = sort_results(results)
 
-    # 3. Compare to previous report
-    print("\n[3/4] Comparing to previous report...")
+    # 4. Compare to previous report
+    print("\n[4/4] Comparing to previous report & saving...")
     prev_df = load_previous_report()
     changes = build_changes(results, prev_df)
 
@@ -724,8 +721,6 @@ def main():
     else:
         print("  → No previous report found. Changes sheet will appear from tomorrow.")
 
-    # 4. Export to Excel & JSON
-    print("\n[4/4] Exporting to Excel & JSON...")
     filepath = export_to_excel(results, changes, prev_df)
     json_path = export_to_json(results)
 
