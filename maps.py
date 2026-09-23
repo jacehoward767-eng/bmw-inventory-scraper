@@ -2,7 +2,7 @@
 BMW Dealership Inventory Scraper (Cloud & Local Edition)
 ========================================================
 Pulls full inventory from BMW of Des Moines and records:
-- Vehicle details (year, make, model, trim, color, VIN, price)
+- Vehicle details (year, make, model, trim, color, VIN, price, mileage)
 - Days on lot (calculated from listing date)
 - 7-day view count (scraped from rendered vehicle page via Selenium)
 - Photo count and a "Needs Photos?" flag (< 3 images = no real photos)
@@ -30,7 +30,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
@@ -44,7 +43,6 @@ REQUEST_DELAY    = 1.5    # seconds between vehicle page loads (base)
 PHOTO_THRESHOLD  = 3      # vehicles with fewer photos than this need shooting
 
 # Residential proxy config — set to None to disable
-# Format: "http://user:pass@host:port" or "http://host:port"
 PROXY = None
 
 SUV_PREFIXES = ["X1", "X2", "X3", "X4", "X5", "X6", "X7", "XM", "IX"]
@@ -81,7 +79,6 @@ def build_driver() -> webdriver.Chrome:
     service = Service(ChromeDriverManager().install())
     driver  = webdriver.Chrome(service=service, options=opts)
     
-    # Mask navigator.webdriver
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": """
@@ -96,7 +93,7 @@ def build_driver() -> webdriver.Chrome:
 
 def fetch_inventory(driver: webdriver.Chrome) -> list:
     """
-    Fetches inventory via the DDC API by executing fetch() calls inside
+    Fetches inventory via the DDC API by executing fetch() inside
     an active Chrome session to inherit valid Akamai bot-verification cookies.
     """
     print(f"Connecting to {DEALER_SITE_ID} via Chrome session...")
@@ -104,7 +101,6 @@ def fetch_inventory(driver: webdriver.Chrome) -> list:
     print(f"  Warming up browser on {warm_url} ...")
     driver.get(warm_url)
     
-    # Allow Akamai scripts to execute and drop tokens
     time.sleep(6)
 
     full_inventory = []
@@ -231,7 +227,6 @@ def get_view_count(driver: webdriver.Chrome, url: str) -> str:
         except Exception:
             pass
 
-        # Strategy 1: Data layer metrics
         try:
             js_views = driver.execute_script(
                 "return window.DDC?.trackingData?.recentViews?.total || "
@@ -243,7 +238,6 @@ def get_view_count(driver: webdriver.Chrome, url: str) -> str:
         except Exception:
             pass
 
-        # Strategy 2: Targeted CSS selectors
         for css in [
             ".vdp-analytics-badge",
             "[class*='shopper-activity']",
@@ -261,7 +255,6 @@ def get_view_count(driver: webdriver.Chrome, url: str) -> str:
             except Exception:
                 continue
 
-        # Strategy 3: Regex fallbacks across DOM
         source = driver.page_source
 
         m = re.search(r'"recentViews"\s*:\s*\{\s*"total"\s*:\s*(\d+)', source)
