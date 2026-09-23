@@ -55,12 +55,13 @@ def jitter_delay(base: float = REQUEST_DELAY):
 
 
 def clean_num(val) -> int | None:
-    """Helper to extract a pure integer from strings like '$81,980' or '13,620 miles'."""
+    """Helper to extract a pure integer from strings like '$99,980' or '3,930 miles'."""
     if val is None:
         return None
     cleaned = re.sub(r'[^\d.]', '', str(val))
     try:
-        return int(float(cleaned)) if cleaned else None
+        n = int(float(cleaned))
+        return n if n > 0 else None
     except (ValueError, TypeError):
         return None
 
@@ -224,9 +225,17 @@ def fetch_inventory(driver: webdriver.Chrome) -> list:
     return full_inventory
 
 
-# ─── SELENIUM / VIEW COUNT ────────────────────────────────────────────────────
+# ─── SELENIUM / VIEW COUNT & PRICE EXTRACTION ─────────────────────────────────
 
-def get_view_count(driver: webdriver.Chrome, url: str) -> str:
+def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
+    """
+    Visits the live vehicle detail page (VDP) and extracts both:
+    1. 7-day view count
+    2. Real displayed vehicle price (via DDC dataLayer, Schema.org JSON, and DOM)
+    """
+    views = "N/A"
+    price = "Call"
+
     try:
         driver.get(url)
 
@@ -237,6 +246,7 @@ def get_view_count(driver: webdriver.Chrome, url: str) -> str:
         except Exception:
             pass
 
+        # ── 1. EXTRACT 7-DAY VIEWS ──────────────────────────────────────────
         try:
             js_views = driver.execute_script(
                 "return window.DDC?.trackingData?.recentViews?.total || "
@@ -244,51 +254,121 @@ def get_view_count(driver: webdriver.Chrome, url: str) -> str:
                 "window.digitalData?.page?.pageInfo?.analyticsViews;"
             )
             if js_views and str(js_views).isdigit():
-                return str(js_views)
+                views = str(js_views)
         except Exception:
             pass
 
-        for css in [
-            ".vdp-analytics-badge",
-            "[class*='shopper-activity']",
-            "[class*='vehicle-views']",
-            "[class*='view-count']",
-            "[data-views]"
-        ]:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, css)
-                for el in elements:
-                    text = el.text or el.get_attribute("data-views") or ""
-                    num = re.search(r'\d+', text)
-                    if num and int(num.group(0)) > 0:
-                        return num.group(0)
-            except Exception:
-                continue
+        if views == "N/A":
+            for css in [
+                ".vdp-analytics-badge",
+                "[class*='shopper-activity']",
+                "[class*='vehicle-views']",
+                "[class*='view-count']",
+                "[data-views]"
+            ]:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, css)
+                    for el in elements:
+                        txt = el.text or el.get_attribute("data-views") or ""
+                        num = re.search(r'\d+', txt)
+                        if num and int(num.group(0)) > 0:
+                            views = num.group(0)
+                            break
+                except Exception:
+                    continue
+                if views != "N/A":
+                    break
 
         source = driver.page_source
+        if views == "N/A":
+            for pattern in [
+                r'"recentViews"\s*:\s*\{\s*"total"\s*:\s*(\d+)',
+                r'"viewCount"\s*:\s*(\d+)',
+                r'(\d+)\s+(?:people\s+)?(?:viewed?|views?)\s+(?:this\s+)?(?:vehicle\s+)?in\s+the\s+(?:past|last)\s+7\s+days',
+                r'(\d+)\s+views?\s+(?:in\s+)?(?:last|past)\s+7\s+days',
+                r'7[- ]day\s+views?[:\s]+(\d+)',
+            ]:
+                m = re.search(pattern, source, re.IGNORECASE)
+                if m:
+                    views = m.group(1)
+                    break
 
-        m = re.search(r'"recentViews"\s*:\s*\{\s*"total"\s*:\s*(\d+)', source)
-        if m:
-            return m.group(1)
+        # ── 2. EXTRACT LIVE PRICE ───────────────────────────────────────────
+        # Method A: DDC dataLayer vehicle object (Fastest & 100% accurate on DDC sites)
+        try:
+            dl_price = driver.execute_script("""
+                const v = window.DDC?.dataLayer?.vehicles?.[0];
+                if (!v) return null;
+                return v.internetPrice || v.askingPrice || v.salePrice || v.retailValue || v.msrp;
+            """)
+            n = clean_num(dl_price)
+            if n and n > 5000:
+                price = f"${n:,}"
+        except Exception:
+            pass
 
-        m = re.search(r'"viewCount"\s*:\s*(\d+)', source)
-        if m:
-            return m.group(1)
+        # Method B: Direct CSS elements used by BMW of Des Moines
+        if price == "Call":
+            css_selectors = [
+                ".price-summary__final-price-value",
+                ".final-price .value",
+                ".price-summary__final-price",
+                ".salePrice .value",
+                ".internetPrice .value",
+                ".retailValue .value",
+                ".price-value",
+                "[data-price]"
+            ]
+            for sel in css_selectors:
+                try:
+                    for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                        txt = el.get_attribute("data-price") or el.text or ""
+                        n = clean_num(txt)
+                        if n and n > 5000:
+                            price = f"${n:,}"
+                            break
+                except Exception:
+                    continue
+                if price != "Call":
+                    break
 
-        for pattern in [
-            r'(\d+)\s+(?:people\s+)?(?:viewed?|views?)\s+(?:this\s+)?(?:vehicle\s+)?in\s+the\s+(?:past|last)\s+7\s+days',
-            r'(\d+)\s+views?\s+(?:in\s+)?(?:last|past)\s+7\s+days',
-            r'7[- ]day\s+views?[:\s]+(\d+)',
-            r'(\d+)\s+7[- ]day\s+views?',
-        ]:
-            m = re.search(pattern, source, re.IGNORECASE)
-            if m:
-                return m.group(1)
+        # Method C: Schema.org structured JSON-LD block
+        if price == "Call":
+            try:
+                scripts = driver.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")
+                for s in scripts:
+                    data = json.loads(s.get_attribute("innerHTML") or "{}")
+                    offers = data.get("offers", {})
+                    if isinstance(offers, dict):
+                        n = clean_num(offers.get("price"))
+                        if n and n > 5000:
+                            price = f"${n:,}"
+                            break
+            except Exception:
+                pass
+
+        # Method D: Source Regex fallbacks
+        if price == "Call":
+            for pat in [
+                r'"internetPrice"\s*:\s*["\']?\$?([\d,]+)',
+                r'"askingPrice"\s*:\s*["\']?\$?([\d,]+)',
+                r'"finalPrice"\s*:\s*["\']?\$?([\d,]+)',
+                r'"salePrice"\s*:\s*["\']?\$?([\d,]+)',
+                r'"price"\s*:\s*["\']?\$?([\d,]+)',
+                r'"retailValue"\s*:\s*["\']?\$?([\d,]+)',
+                r'"msrp"\s*:\s*["\']?\$?([\d,]+)'
+            ]:
+                pm = re.search(pat, source, re.IGNORECASE)
+                if pm:
+                    n = clean_num(pm.group(1))
+                    if n and n > 5000:
+                        price = f"${n:,}"
+                        break
 
     except Exception as e:
         print(f"[driver error: {e}]", end=" ")
 
-    return "N/A"
+    return views, price
 
 
 # ─── DATA HELPERS ─────────────────────────────────────────────────────────────
@@ -301,75 +381,19 @@ def get_attr(car: dict, name: str, fallback: str = "N/A") -> str:
     return fallback
 
 
-def get_pricing_field(car: dict) -> str:
-    """
-    Extracts vehicle price across all standard Dealer.com payload structures,
-    covering Used prices, New car MSRPs, and composite pricing blocks.
-    """
-    # Keys to prioritize (sale/asking first, then MSRP/retail/composite)
-    target_keys = [
-        "price", "saleprice", "internetprice", "askingprice", 
-        "finalprice", "compositeprice", "msrp", "retailprice", 
-        "baseprice", "displayprice"
-    ]
-
-    # 1. Check direct top-level keys
-    for k, v in car.items():
-        if k.lower() in target_keys:
-            num = clean_num(v)
-            if num and num > 0:
-                return f"${num:,}"
-
-    # 2. Check priceOverview block
-    po = car.get("priceOverview", {})
-    if isinstance(po, dict):
-        for k, v in po.items():
-            if k.lower() in target_keys:
-                num = clean_num(v)
-                if num and num > 0:
-                    return f"${num:,}"
-
-    # 3. Check pricing structure (can be dict or list)
-    pricing = car.get("pricing", {})
-    if isinstance(pricing, dict):
-        for k, v in pricing.items():
-            if k.lower() in target_keys:
-                num = clean_num(v)
-                if num and num > 0:
-                    return f"${num:,}"
-    elif isinstance(pricing, list):
-        for item in pricing:
-            if isinstance(item, dict):
-                # Often formatted as {"type": "MSRP", "value": 78900}
-                num = clean_num(item.get("value") or item.get("price") or item.get("amount"))
-                if num and num > 0:
-                    return f"${num:,}"
-
-    # 4. Check attributes array (handles both "msrp", "internetPrice", etc.)
-    for attr in car.get("attributes", []):
-        if isinstance(attr, dict):
-            name = str(attr.get("name", "")).lower()
-            if any(t in name for t in target_keys):
-                num = clean_num(attr.get("value"))
-                if num and num > 0:
-                    return f"${num:,}"
-
-    return "Call"
-
-
 def get_mileage_field(car: dict) -> str:
     """Extracts odometer reading across DDC payload variations."""
     for key in ["odometer", "mileage", "miles"]:
         num = clean_num(car.get(key))
-        if num and num > 0:
+        if num:
             return f"{num:,}"
 
     for attr in car.get("attributes", []):
         if isinstance(attr, dict):
-            name = attr.get("name", "").lower()
+            name = str(attr.get("name", "")).lower()
             if name in ["odometer", "mileage", "miles", "odometervalue"]:
                 num = clean_num(attr.get("value"))
-                if num and num > 0:
+                if num:
                     return f"{num:,}"
 
     return "N/A"
@@ -430,17 +454,17 @@ def process_data(inventory_list: list, driver: webdriver.Chrome) -> list:
 
         print(f"[{i+1:>3}/{total}] {full_name} ...", end=" ", flush=True)
 
-        views                     = get_view_count(driver, full_link)
+        views, price              = get_page_metrics(driver, full_link)
         days_on_lot               = calculate_days_on_lot(car)
         photo_count, needs_photos = get_photo_info(car)
         is_suv                    = "SUV" if any(model.upper().startswith(x) for x in SUV_PREFIXES) else "Car"
-        price                     = get_pricing_field(car)
         mileage                   = get_mileage_field(car)
 
-        views_tag  = f"FOUND: {views} views" if views != "N/A" else "NOT FOUND: views"
+        views_tag  = f"VIEWS: {views}" if views != "N/A" else "NO VIEWS"
         days_tag   = f"{days_on_lot}d on lot" if days_on_lot != "N/A" else "lot date unknown"
         photos_tag = f"{photo_count} photos" + (" ⚠" if needs_photos == "Yes" else "")
-        print(f"{views_tag}  |  {days_tag}  |  {photos_tag}")
+        price_tag  = f"PRICE: {price}"
+        print(f"{views_tag}  |  {price_tag}  |  {days_tag}  |  {photos_tag}")
 
         results.append({
             "Vehicle":       full_name,
@@ -737,7 +761,7 @@ def main():
     print(f"  Run time: {start_time.strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
 
-    # 1. Initialize Headless Browser
+    # 1. Initialize Headless Chrome
     print("\n[1/4] Launching headless browser...")
     driver = build_driver()
 
@@ -752,8 +776,8 @@ def main():
 
         print(f"\n  Total vehicles to process: {len(inventory)}")
 
-        # 3. Scrape view counts
-        print("\n[3/4] Collecting view counts across vehicle pages...")
+        # 3. Scrape view counts and live rendered prices
+        print("\n[3/4] Collecting views & live prices across vehicle pages...")
         results = process_data(inventory, driver)
 
     finally:
