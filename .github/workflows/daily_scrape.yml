@@ -2,6 +2,7 @@ name: Daily Inventory Scrape
 
 on:
   schedule:
+    # 12:00 UTC = 7:00 AM Central Daylight Time
     - cron: '0 12 * * *'
   workflow_dispatch:
 
@@ -50,13 +51,13 @@ jobs:
       - name: Run Inventory Scraper
         run: python maps.py
 
-      - name: Commit and Push Reports to Private Repo
+      - name: Commit and Push Reports to Repository
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'Automated daily inventory snapshot'
           file_pattern: 'BMW_Inventory_Reports/*.xlsx inventory.json'
 
-      - name: Stage JSON for Pages
+      - name: Stage JSON for GitHub Pages
         run: |
           mkdir -p _site
           cp inventory.json _site/index.json
