@@ -1,0 +1,9 @@
+requests
+cloudscraper
+pandas
+xlsxwriter
+openpyxl
+selenium
+webdriver-manager
+python-dateutil
+brotli
