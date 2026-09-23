@@ -1,0 +1,49 @@
+name: Daily Inventory Scrape
+
+on:
+  schedule:
+    # 12:00 UTC is 7:00 AM CDT (Central Daylight Time)
+    - cron: '0 12 * * *'
+  # Allows you to click a button and run it manually anytime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Google Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl unzip
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Inventory Scraper
+        run: |
+          python maps.py
+
+      - name: Commit and Push Inventory Updates
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'Automated daily inventory snapshot'
+          file_pattern: 'BMW_Inventory_Reports/*.xlsx inventory.json'
