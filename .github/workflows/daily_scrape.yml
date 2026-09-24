@@ -57,10 +57,124 @@ jobs:
           commit_message: 'Automated daily inventory snapshot'
           file_pattern: 'BMW_Inventory_Reports/*.xlsx inventory.json'
 
-      - name: Stage JSON for GitHub Pages
+      - name: Stage Site for GitHub Pages
         run: |
           mkdir -p _site
+          
+          # 1. Copy JSON for Siri / Shortcut integration
           cp inventory.json _site/index.json
+          
+          # 2. Grab and alias the newest Excel report
+          LATEST_XLSX=$(ls -t BMW_Inventory_Reports/*.xlsx | head -n 1)
+          cp "$LATEST_XLSX" _site/latest_inventory.xlsx
+          
+          # 3. Copy full historical archive
+          cp -r BMW_Inventory_Reports _site/reports
+
+          # 4. Generate clean landing page for coworkers
+          cat << 'EOF' > _site/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>BMW of Des Moines — Daily Inventory Hub</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body { 
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+                background: #f5f6f8; 
+                color: #1c1d1f; 
+                display: flex; 
+                justify-content: center; 
+                align-items: center; 
+                min-height: 100vh; 
+                padding: 24px; 
+              }
+              .card { 
+                background: #ffffff; 
+                padding: 40px 32px; 
+                border-radius: 16px; 
+                box-shadow: 0 8px 30px rgba(0,0,0,0.06); 
+                max-width: 480px; 
+                width: 100%; 
+                text-align: center; 
+              }
+              .badge {
+                display: inline-block;
+                background: #e8f3fc;
+                color: #1c69d3;
+                font-size: 0.75rem;
+                font-weight: 700;
+                letter-spacing: 0.05em;
+                text-transform: uppercase;
+                padding: 4px 10px;
+                border-radius: 9999px;
+                margin-bottom: 16px;
+              }
+              h1 { 
+                font-size: 1.6rem; 
+                font-weight: 700;
+                margin-bottom: 8px; 
+                color: #0f1115; 
+              }
+              p { 
+                color: #636773; 
+                font-size: 0.95rem; 
+                margin-bottom: 28px; 
+                line-height: 1.4;
+              }
+              .btn { 
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                background: #1c69d3; 
+                color: white; 
+                padding: 14px 20px; 
+                border-radius: 10px; 
+                font-size: 0.95rem;
+                font-weight: 600; 
+                text-decoration: none; 
+                margin-bottom: 12px; 
+                transition: background 0.15s ease, transform 0.1s ease; 
+              }
+              .btn:hover { 
+                background: #1552a6; 
+                transform: translateY(-1px);
+              }
+              .btn-secondary { 
+                background: #f0f2f5; 
+                color: #2c3038; 
+              }
+              .btn-secondary:hover { 
+                background: #e4e6ea; 
+              }
+              .timestamp { 
+                font-size: 0.8rem; 
+                color: #9499a6; 
+                margin-top: 20px; 
+              }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <div class="badge">BMW of Des Moines</div>
+              <h1>Inventory & Velocity Hub</h1>
+              <p>Daily merchandising spreadsheets, photo tracking, and Siri voice inventory feeds.</p>
+              
+              <a href="latest_inventory.xlsx" class="btn" download>
+                📥 Download Today's Report (.xlsx)
+              </a>
+              <a href="index.json" class="btn btn-secondary" target="_blank">
+                🔗 View Raw JSON Feed
+              </a>
+              
+              <div class="timestamp">Snapshots update every morning at 7:00 AM Central</div>
+            </div>
+          </body>
+          </html>
+          EOF
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
