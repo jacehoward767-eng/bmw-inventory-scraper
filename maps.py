@@ -6,6 +6,8 @@ Pulls full inventory from BMW of Des Moines and records:
 - Days on lot (calculated from listing date)
 - 7-day view count (scraped from rendered vehicle page via Selenium)
 - Photo count and a "Needs Photos?" flag (< 3 images = no real photos)
+- Excludes "In Transit" and "In Production" units (via API and DOM inspection)
+- Condition mapped to "New", "Used", "Certified", or "Retired Service Loaner"
 - A "Changes" sheet comparing today vs the most recent previous report
 - Outputs 'inventory.json' for iPhone / Siri / Apple Shortcuts integration
 
@@ -102,6 +104,56 @@ def build_driver() -> webdriver.Chrome:
     return driver
 
 
+def is_transit_or_production_payload(car: dict) -> bool:
+    """Checks the initial API item payload for in-transit/production markers."""
+    for field in ["status", "inventoryStatus", "availability", "merchandisingStatus", "orderStatus"]:
+        val = str(car.get(field, "")).lower()
+        if any(term in val for term in ["transit", "production", "preorder", "build", "order"]):
+            return True
+
+    for attr in car.get("attributes", []):
+        if isinstance(attr, dict):
+            name = str(attr.get("name", "")).lower()
+            val  = str(attr.get("value", "")).lower()
+            if any(term in name for term in ["transit", "production", "status"]):
+                if any(term in val for term in ["transit", "production", "true", "yes"]):
+                    return True
+            if "status" in name and any(term in val for term in ["transit", "production"]):
+                return True
+
+    return False
+
+
+def determine_condition(car: dict, source_category: str) -> str:
+    """Standardizes condition to New, Used, Certified, or Retired Service Loaner."""
+    if source_category == "auto-rsl":
+        return "Retired Service Loaner"
+
+    # Check Certified status
+    is_cert = str(car.get("certified", "")).lower() in ["true", "1", "yes"]
+    if not is_cert:
+        for attr in car.get("attributes", []):
+            if isinstance(attr, dict):
+                name = str(attr.get("name", "")).lower()
+                val  = str(attr.get("value", "")).lower()
+                if "certified" in name and val in ["true", "yes", "1"]:
+                    is_cert = True
+                    break
+
+    if is_cert:
+        return "Certified"
+
+    raw_cond = str(car.get("condition", "")).strip().lower()
+    if "cert" in raw_cond:
+        return "Certified"
+    elif "new" in raw_cond:
+        return "New"
+    elif "used" in raw_cond:
+        return "Used"
+
+    return "Used" if source_category == "auto-used" else "New"
+
+
 def fetch_inventory(driver: webdriver.Chrome) -> list:
     """
     Fetches inventory via the DDC API by executing fetch() inside
@@ -116,6 +168,7 @@ def fetch_inventory(driver: webdriver.Chrome) -> list:
 
     full_inventory = []
     seen_vins = set()
+    skipped_transit_count = 0
 
     endpoints = [
         {"alias": "INVENTORY_LISTING_DEFAULT_AUTO_NEW",  "config_id": "auto-new"},
@@ -198,19 +251,23 @@ def fetch_inventory(driver: webdriver.Chrome) -> list:
                 break
 
             if items:
-                new_vins = [v.get("vin") for v in items if v.get("vin") and v.get("vin") not in seen_vins]
-
-                if not new_vins:
-                    print("0 new vehicles (reached end or duplicates).")
-                    break
-
-                print(f"Found {len(new_vins)} new vehicles.")
-
+                new_items_added = 0
                 for v in items:
                     vin = v.get("vin")
-                    if vin and vin not in seen_vins:
-                        full_inventory.append(v)
-                        seen_vins.add(vin)
+                    if not vin or vin in seen_vins:
+                        continue
+
+                    # Filter out transit and production units from payload
+                    if is_transit_or_production_payload(v):
+                        skipped_transit_count += 1
+                        continue
+
+                    v["_source_category"] = label
+                    full_inventory.append(v)
+                    seen_vins.add(vin)
+                    new_items_added += 1
+
+                print(f"Found {new_items_added} eligible vehicles.")
 
                 if len(items) < page_size:
                     print("    -> End of category reached.")
@@ -222,19 +279,22 @@ def fetch_inventory(driver: webdriver.Chrome) -> list:
                 print("0 vehicles found (End of category).")
                 break
 
+    if skipped_transit_count > 0:
+        print(f"\n  [Filter Notice] Skipped {skipped_transit_count} vehicles listed as In Transit/Production during API pull.")
+
     return full_inventory
 
 
-# ─── SELENIUM / VIEW COUNT & PRICE EXTRACTION ─────────────────────────────────
+# ─── SELENIUM / VIEW COUNT, PRICE, & PAGE-LEVEL TRANSIT CHECK ─────────────────
 
-def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
+def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool]:
     """
-    Visits the live vehicle detail page (VDP) and extracts both:
-    1. 7-day view count
-    2. Real displayed vehicle price (via DDC dataLayer, Schema.org JSON, and DOM)
+    Visits the live vehicle detail page (VDP) and returns:
+    (views, price, is_in_transit)
     """
     views = "N/A"
     price = "Call"
+    is_in_transit = False
 
     try:
         driver.get(url)
@@ -246,7 +306,26 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
         except Exception:
             pass
 
-        # ── 1. EXTRACT 7-DAY VIEWS ──────────────────────────────────────────
+        # ── 1. CHECK FOR IN TRANSIT / PRODUCTION ON LIVE PAGE ───────────────
+        try:
+            dl_status = driver.execute_script("""
+                const v = window.DDC?.dataLayer?.vehicles?.[0];
+                return (v?.status || '') + ' ' + (v?.inventoryStatus || '');
+            """)
+            if any(term in str(dl_status).lower() for term in ["transit", "production", "preorder"]):
+                return "N/A", "Call", True
+        except Exception:
+            pass
+
+        # Check DOM badges for .in-transit
+        try:
+            badges = driver.find_elements(By.CSS_SELECTOR, ".in-transit, [class*='transit'], [title*='In Transit']")
+            if badges:
+                return "N/A", "Call", True
+        except Exception:
+            pass
+
+        # ── 2. EXTRACT 7-DAY VIEWS ──────────────────────────────────────────
         try:
             js_views = driver.execute_script(
                 "return window.DDC?.trackingData?.recentViews?.total || "
@@ -280,6 +359,12 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
                     break
 
         source = driver.page_source
+
+        # Check Schema JSON-LD for PreOrder
+        if 'PreOrder' in source or 'in transit' in source.lower():
+            if re.search(r'"status"\s*:\s*"In Transit"', source, re.IGNORECASE) or 'PreOrder' in source:
+                return "N/A", "Call", True
+
         if views == "N/A":
             for pattern in [
                 r'"recentViews"\s*:\s*\{\s*"total"\s*:\s*(\d+)',
@@ -293,8 +378,8 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
                     views = m.group(1)
                     break
 
-        # ── 2. EXTRACT LIVE PRICE ───────────────────────────────────────────
-        # Method A: DDC dataLayer vehicle object (Fastest & 100% accurate on DDC sites)
+        # ── 3. EXTRACT LIVE PRICE ───────────────────────────────────────────
+        # Method A: DDC dataLayer
         try:
             dl_price = driver.execute_script("""
                 const v = window.DDC?.dataLayer?.vehicles?.[0];
@@ -307,7 +392,7 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
         except Exception:
             pass
 
-        # Method B: Direct CSS elements used by BMW of Des Moines
+        # Method B: Direct DOM Selectors
         if price == "Call":
             css_selectors = [
                 ".price-summary__final-price-value",
@@ -332,7 +417,7 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
                 if price != "Call":
                     break
 
-        # Method C: Schema.org structured JSON-LD block
+        # Method C: Schema JSON-LD
         if price == "Call":
             try:
                 scripts = driver.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")
@@ -368,7 +453,7 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
     except Exception as e:
         print(f"[driver error: {e}]", end=" ")
 
-    return views, price
+    return views, price, is_in_transit
 
 
 # ─── DATA HELPERS ─────────────────────────────────────────────────────────────
@@ -454,17 +539,24 @@ def process_data(inventory_list: list, driver: webdriver.Chrome) -> list:
 
         print(f"[{i+1:>3}/{total}] {full_name} ...", end=" ", flush=True)
 
-        views, price              = get_page_metrics(driver, full_link)
+        views, price, is_in_transit = get_page_metrics(driver, full_link)
+
+        if is_in_transit:
+            print("SKIPPED: In Transit / In Production")
+            jitter_delay(REQUEST_DELAY)
+            continue
+
         days_on_lot               = calculate_days_on_lot(car)
         photo_count, needs_photos = get_photo_info(car)
         is_suv                    = "SUV" if any(model.upper().startswith(x) for x in SUV_PREFIXES) else "Car"
         mileage                   = get_mileage_field(car)
+        condition                 = determine_condition(car, car.get("_source_category", ""))
 
         views_tag  = f"VIEWS: {views}" if views != "N/A" else "NO VIEWS"
         days_tag   = f"{days_on_lot}d on lot" if days_on_lot != "N/A" else "lot date unknown"
         photos_tag = f"{photo_count} photos" + (" ⚠" if needs_photos == "Yes" else "")
         price_tag  = f"PRICE: {price}"
-        print(f"{views_tag}  |  {price_tag}  |  {days_tag}  |  {photos_tag}")
+        print(f"{views_tag}  |  {price_tag}  |  {condition}  |  {days_tag}  |  {photos_tag}")
 
         results.append({
             "Vehicle":       full_name,
@@ -473,7 +565,7 @@ def process_data(inventory_list: list, driver: webdriver.Chrome) -> list:
             "Model":         model,
             "Trim":          trim,
             "Type":          is_suv,
-            "Condition":     str(car.get("condition", "N/A")).title(),
+            "Condition":     condition,
             "Ext Color":     get_attr(car, "exteriorColor"),
             "Int Color":     get_attr(car, "interiorColor"),
             "Price":         price,
@@ -674,7 +766,7 @@ def export_to_excel(results: list, changes: dict, prev_df: pd.DataFrame | None) 
         for row_num, row in enumerate(df.itertuples(index=False), start=1):
             row_condition    = str(row[condition_idx]).lower()
             row_needs_photos = str(row[needs_photos_idx])
-            flag_condition   = row_condition == "used" and row_needs_photos == "Yes"
+            flag_condition   = ("used" in row_condition or "loaner" in row_condition) and row_needs_photos == "Yes"
 
             for col_num, (col_name, value) in enumerate(zip(df.columns, row)):
                 if col_num == link_col_idx:
@@ -706,7 +798,7 @@ def export_to_excel(results: list, changes: dict, prev_df: pd.DataFrame | None) 
 
         col_widths = {
             "Vehicle": 38, "Year": 6, "Make": 8, "Model": 10, "Trim": 18,
-            "Type": 6, "Condition": 10, "Ext Color": 18, "Int Color": 18,
+            "Type": 6, "Condition": 22, "Ext Color": 18, "Int Color": 18,
             "Price": 12, "Mileage": 12,
             "Days on Lot": 12, "Views (7D)": 12,
             "Photos": 8, "Needs Photos?": 14,
@@ -774,10 +866,10 @@ def main():
             print("\nNo inventory returned. Stopping.")
             return
 
-        print(f"\n  Total vehicles to process: {len(inventory)}")
+        print(f"\n  Total initial vehicles found: {len(inventory)}")
 
         # 3. Scrape view counts and live rendered prices
-        print("\n[3/4] Collecting views & live prices across vehicle pages...")
+        print("\n[3/4] Collecting views, live prices & verifying lot availability...")
         results = process_data(inventory, driver)
 
     finally:
@@ -805,7 +897,7 @@ def main():
     needs_photos_count = sum(1 for r in results if r["Needs Photos?"] == "Yes")
     print(f"\n  ✓ Excel Report saved: {filepath}")
     print(f"  ✓ Siri JSON saved: {json_path}")
-    print(f"  ✓ {len(results)} vehicles recorded.")
+    print(f"  ✓ {len(results)} physical on-lot vehicles recorded.")
     print(f"  ✓ {needs_photos_count} vehicles flagged as needing photos.")
 
     elapsed = datetime.now() - start_time
