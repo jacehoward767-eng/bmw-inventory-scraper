@@ -51,16 +51,21 @@ jobs:
       - name: Run Inventory Scraper
         run: python maps.py
 
+      - name: Stage Artifacts for Git Commit and GitHub Pages
+        run: |
+          mkdir -p _site
+          cp inventory.json _site/index.json
+          
+          # Find the freshest timestamped Excel report and stage it under a fixed name
+          LATEST_EXCEL=$(ls -t BMW_Inventory_Reports/BMW_Inventory_*.xlsx | head -n 1)
+          cp "$LATEST_EXCEL" latest_inventory.xlsx
+          cp "$LATEST_EXCEL" _site/latest_inventory.xlsx
+
       - name: Commit and Push Reports to Repository
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'Automated daily inventory snapshot'
-          file_pattern: 'BMW_Inventory_Reports/*.xlsx inventory.json'
-
-      - name: Stage JSON for GitHub Pages
-        run: |
-          mkdir -p _site
-          cp inventory.json _site/index.json
+          file_pattern: 'BMW_Inventory_Reports/*.xlsx inventory.json latest_inventory.xlsx'
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
