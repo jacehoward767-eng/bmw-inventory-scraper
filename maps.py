@@ -42,7 +42,7 @@ OUTPUT_FOLDER    = "BMW_Inventory_Reports"
 JSON_OUTPUT      = "inventory.json"
 PAGE_LOAD_WAIT   = 8      # seconds to wait for JS to render view count
 REQUEST_DELAY    = 1.5    # seconds between vehicle page loads (base)
-PHOTO_THRESHOLD  = 3      # vehicles with fewer photos than this need shooting
+PHOTO_THRESHOLD  = 20      # vehicles with fewer photos than this need shooting
 
 PROXY = None
 
