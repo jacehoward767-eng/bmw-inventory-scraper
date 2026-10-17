@@ -5,7 +5,7 @@ Pulls full inventory from BMW of Des Moines and records:
 - Vehicle details (year, make, model, trim, color, VIN, price, mileage)
 - Days on lot (calculated from listing date)
 - 7-day view count (scraped from rendered vehicle page via Selenium)
-- Photo count and a "Needs Photos?" flag (< 3 images = no real photos)
+- Photo count and a "Needs Photos?" flag (< 20 images = needs shooting)
 - Excludes "In Transit" and "In Production" units (via API and DOM inspection)
 - Condition mapped to "New", "Used", "Certified", or "Retired Service Loaner"
 - A "Changes" sheet comparing today vs the most recent previous report
@@ -40,9 +40,9 @@ API_URL          = f"{BASE_URL}/api/widget/ws-inv-data/getInventory"
 DEALER_SITE_ID   = "bmwofdesmoines"
 OUTPUT_FOLDER    = "BMW_Inventory_Reports"
 JSON_OUTPUT      = "inventory.json"
-PAGE_LOAD_WAIT   = 8      # seconds to wait for JS to render view count
+PAGE_LOAD_WAIT   = 14     # extended wait time for slow-loading view badges
 REQUEST_DELAY    = 1.5    # seconds between vehicle page loads (base)
-PHOTO_THRESHOLD  = 20      # vehicles with fewer photos than this need shooting
+PHOTO_THRESHOLD  = 20     # vehicles with fewer photos than this need shooting
 
 PROXY = None
 
@@ -257,7 +257,6 @@ def fetch_inventory(driver: webdriver.Chrome) -> list:
                     if not vin or vin in seen_vins:
                         continue
 
-                    # Filter out transit and production units from payload
                     if is_transit_or_production_payload(v):
                         skipped_transit_count += 1
                         continue
@@ -299,14 +298,15 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool
     try:
         driver.get(url)
 
+        # 1. Wait for page readiness
         try:
-            WebDriverWait(driver, PAGE_LOAD_WAIT).until(
+            WebDriverWait(driver, 10).until(
                 lambda d: d.execute_script("return document.readyState === 'complete'")
             )
         except Exception:
             pass
 
-        # ── 1. CHECK FOR IN TRANSIT / PRODUCTION ON LIVE PAGE ───────────────
+        # 2. Check In-Transit / PreOrder Markers
         try:
             dl_status = driver.execute_script("""
                 const v = window.DDC?.dataLayer?.vehicles?.[0];
@@ -317,7 +317,6 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool
         except Exception:
             pass
 
-        # Check DOM badges for .in-transit
         try:
             badges = driver.find_elements(By.CSS_SELECTOR, ".in-transit, [class*='transit'], [title*='In Transit']")
             if badges:
@@ -325,46 +324,62 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool
         except Exception:
             pass
 
-        # ── 2. EXTRACT 7-DAY VIEWS ──────────────────────────────────────────
-        try:
-            js_views = driver.execute_script(
-                "return window.DDC?.trackingData?.recentViews?.total || "
-                "window.DDC?.trackingData?.viewCount || "
-                "window.digitalData?.page?.pageInfo?.analyticsViews;"
-            )
-            if js_views and str(js_views).isdigit():
-                views = str(js_views)
-        except Exception:
-            pass
+        # 3. Dynamic polling loop for late-loading view counts
+        view_selectors = [
+            ".vdp-analytics-badge",
+            "[class*='shopper-activity']",
+            "[class*='vehicle-views']",
+            "[class*='view-count']",
+            "[data-views]",
+            ".additional-details li",
+            ".highlight-badge"
+        ]
 
-        if views == "N/A":
-            for css in [
-                ".vdp-analytics-badge",
-                "[class*='shopper-activity']",
-                "[class*='vehicle-views']",
-                "[class*='view-count']",
-                "[data-views]"
-            ]:
+        poll_start = time.time()
+        max_poll = PAGE_LOAD_WAIT
+
+        while time.time() - poll_start < max_poll:
+            # Check tracking objects
+            try:
+                js_views = driver.execute_script("""
+                    return window.DDC?.trackingData?.recentViews?.total || 
+                           window.DDC?.trackingData?.viewCount || 
+                           window.digitalData?.page?.pageInfo?.analyticsViews;
+                """)
+                if js_views and str(js_views).isdigit():
+                    views = str(js_views)
+                    break
+            except Exception:
+                pass
+
+            # Check DOM elements
+            for css in view_selectors:
                 try:
                     elements = driver.find_elements(By.CSS_SELECTOR, css)
                     for el in elements:
                         txt = el.text or el.get_attribute("data-views") or ""
-                        num = re.search(r'\d+', txt)
-                        if num and int(num.group(0)) > 0:
-                            views = num.group(0)
-                            break
+                        if "view" in txt.lower() or el.get_attribute("data-views"):
+                            num = re.search(r'\d+', txt)
+                            if num and int(num.group(0)) > 0:
+                                views = num.group(0)
+                                break
                 except Exception:
                     continue
                 if views != "N/A":
                     break
 
+            if views != "N/A":
+                break
+
+            time.sleep(0.5)
+
         source = driver.page_source
 
-        # Check Schema JSON-LD for PreOrder
-        if 'PreOrder' in source or 'in transit' in source.lower():
-            if re.search(r'"status"\s*:\s*"In Transit"', source, re.IGNORECASE) or 'PreOrder' in source:
-                return "N/A", "Call", True
+        # Secondary transit check from raw HTML
+        if 'PreOrder' in source or re.search(r'"status"\s*:\s*"In Transit"', source, re.IGNORECASE):
+            return "N/A", "Call", True
 
+        # Regex fallback across page source
         if views == "N/A":
             for pattern in [
                 r'"recentViews"\s*:\s*\{\s*"total"\s*:\s*(\d+)',
@@ -378,8 +393,11 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool
                     views = m.group(1)
                     break
 
-        # ── 3. EXTRACT LIVE PRICE ───────────────────────────────────────────
-        # Method A: DDC dataLayer
+        # If page loaded normally but views were suppressed by DDC (< 5 threshold)
+        if views == "N/A" and ("vehicleViews_minimumViews" in source or "#vehicle-title1-app-root" in source):
+            views = "< 5"
+
+        # 4. Extract Live Price
         try:
             dl_price = driver.execute_script("""
                 const v = window.DDC?.dataLayer?.vehicles?.[0];
@@ -392,7 +410,6 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool
         except Exception:
             pass
 
-        # Method B: Direct DOM Selectors
         if price == "Call":
             css_selectors = [
                 ".price-summary__final-price-value",
@@ -417,7 +434,6 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool
                 if price != "Call":
                     break
 
-        # Method C: Schema JSON-LD
         if price == "Call":
             try:
                 scripts = driver.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")
@@ -432,7 +448,6 @@ def get_page_metrics(driver: webdriver.Chrome, url: str) -> tuple[str, str, bool
             except Exception:
                 pass
 
-        # Method D: Source Regex fallbacks
         if price == "Call":
             for pat in [
                 r'"internetPrice"\s*:\s*["\']?\$?([\d,]+)',
@@ -589,7 +604,9 @@ def sort_results(results: list) -> list:
         try:
             return (0, -int(v))
         except (ValueError, TypeError):
-            return (1, 0)
+            if v == "< 5":
+                return (1, -1)
+            return (2, 0)
     return sorted(results, key=sort_key)
 
 
@@ -758,10 +775,11 @@ def export_to_excel(results: list, changes: dict, prev_df: pd.DataFrame | None) 
         for col_num, col_name in enumerate(df.columns):
             ws.write(0, col_num, col_name, header_fmt)
 
-        numeric_cols     = {"Views (7D)", "Days on Lot", "Photos"}
+        numeric_cols     = {"Days on Lot", "Photos"}
         link_col_idx     = df.columns.get_loc("Link")
         needs_photos_idx = df.columns.get_loc("Needs Photos?")
         condition_idx    = df.columns.get_loc("Condition")
+        views_idx        = df.columns.get_loc("Views (7D)")
 
         for row_num, row in enumerate(df.itertuples(index=False), start=1):
             row_condition    = str(row[condition_idx]).lower()
@@ -779,6 +797,11 @@ def export_to_excel(results: list, changes: dict, prev_df: pd.DataFrame | None) 
                     ws.write(row_num, col_num, value, needs_fmt if str(value) == "Yes" else ok_fmt)
                 elif col_num == condition_idx:
                     ws.write(row_num, col_num, value, used_needs_photos_fmt if flag_condition else cell_fmt)
+                elif col_num == views_idx:
+                    try:
+                        ws.write_number(row_num, col_num, int(value), num_fmt)
+                    except (ValueError, TypeError):
+                        ws.write(row_num, col_num, value, cell_fmt)
                 elif col_name in numeric_cols:
                     try:
                         ws.write_number(row_num, col_num, int(value), num_fmt)
